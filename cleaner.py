@@ -1,3 +1,4 @@
+import argparse
 import os
 import json
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,19 @@ from pyrogram.raw.functions.messages import Search
 from pyrogram.raw.types import InputPeerSelf, InputMessagesFilterEmpty
 from pyrogram.raw.types.messages import ChannelMessages
 from pyrogram.errors import FloodWait, UnknownError
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(
+        description='Delete or preview your Telegram messages in selected groups.'
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='List messages that would be deleted without actually deleting them.',
+    )
+    return parser.parse_args()
+
+CLI_ARGS = parse_cli_args()
 
 cachePath = os.path.abspath(__file__)
 cachePath = os.path.dirname(cachePath)
@@ -33,7 +47,14 @@ if not os.path.exists(cachePath):
 
 
 class Cleaner:
-    def __init__(self, chats=None, search_chunk_size=100, delete_chunk_size=100, days_threshold=None):
+    def __init__(
+        self,
+        chats=None,
+        search_chunk_size=100,
+        delete_chunk_size=100,
+        days_threshold=None,
+        dry_run=False,
+    ):
         self.chats = chats or []
         if search_chunk_size > 100:
             # https://github.com/gurland/telegram-delete-all-messages/issues/31
@@ -46,6 +67,8 @@ class Cleaner:
         self.delete_chunk_size = delete_chunk_size
         self.days_threshold = days_threshold
         self.cutoff_datetime = None
+        self.local_timezone = datetime.now().astimezone().tzinfo or timezone.utc
+        self.dry_run = dry_run
         if days_threshold:
             self.set_days_threshold(days_threshold)
 
@@ -102,20 +125,66 @@ class Cleaner:
         if recursive == 1:
             self.run()
 
-    def prompt_days_threshold(self):
+    def prompt_cutoff(self):
+        prompt_text = (
+            'Delete messages sent before either a day count (e.g. 30) or a '
+            'timestamp in MM-DD-YYYY[ hh:mm[:ss]] format: '
+        )
         while True:
-            try:
-                days_input = input('Delete only messages older than how many days? ')
-                days = int(days_input.strip())
-                if days <= 0:
-                    raise ValueError
-            except ValueError:
-                print('Please enter a positive integer value (e.g. 30).')
+            user_input = input(prompt_text).strip()
+            if not user_input:
+                print('Input cannot be empty.')
                 continue
 
-            self.set_days_threshold(days)
-            print(f'\nMessages newer than {days} day(s) will be skipped.\n')
-            break
+            if self.try_set_days_threshold(user_input):
+                break
+
+            if self.try_set_timestamp_cutoff(user_input):
+                break
+
+            print(
+                'Invalid input. Provide a positive integer number of days or '
+                'a timestamp such as 03-25-2024 15:30:00.'
+            )
+
+    def try_set_days_threshold(self, raw_value):
+        try:
+            days = int(raw_value)
+        except ValueError:
+            return False
+
+        if days <= 0:
+            print('Please enter a positive integer value (e.g. 30).')
+            return False
+
+        self.set_days_threshold(days)
+        print(f'\nMessages newer than {days} day(s) will be skipped.\n')
+        return True
+
+    def try_set_timestamp_cutoff(self, raw_value):
+        cutoff = self.parse_cutoff_timestamp(raw_value)
+        if not cutoff:
+            return False
+
+        self.set_cutoff_datetime(cutoff)
+        local_str, utc_str = self.describe_cutoff_times()
+        print(f'\nMessages sent after {local_str} (local) / {utc_str} will be skipped.\n')
+        return True
+
+    @staticmethod
+    def parse_cutoff_timestamp(raw_value):
+        formats = (
+            '%m-%d-%Y %H:%M:%S',
+            '%m-%d-%Y %H:%M',
+            '%m-%d-%Y',
+        )
+        for date_format in formats:
+            try:
+                parsed = datetime.strptime(raw_value, date_format)
+                return parsed
+            except ValueError:
+                continue
+        return None
 
     def set_days_threshold(self, days):
         if days <= 0:
@@ -123,6 +192,33 @@ class Cleaner:
         self.days_threshold = days
         now = datetime.now(timezone.utc)
         self.cutoff_datetime = now - timedelta(days=days)
+
+    def set_cutoff_datetime(self, cutoff_datetime):
+        if cutoff_datetime.tzinfo is None:
+            cutoff_datetime = cutoff_datetime.replace(tzinfo=self.local_timezone)
+        else:
+            cutoff_datetime = cutoff_datetime.astimezone(self.local_timezone)
+        cutoff_datetime = cutoff_datetime.astimezone(timezone.utc)
+        self.days_threshold = None
+        self.cutoff_datetime = cutoff_datetime
+
+    def describe_cutoff_times(self):
+        if not self.cutoff_datetime:
+            return ('', '')
+        local_time = self.cutoff_datetime.astimezone(self.local_timezone)
+        local_str = local_time.strftime('%Y-%m-%d %H:%M:%S %Z')
+        utc_str = self.cutoff_datetime.strftime('%Y-%m-%d %H:%M:%S %Z')
+        return local_str, utc_str
+
+    @staticmethod
+    def message_preview(message, max_length=30):
+        content = message.text or message.caption or ''
+        content = content.replace('\n', ' ').strip()
+        if not content:
+            content = '[non-text message]'
+        if len(content) > max_length:
+            content = content[:max_length - 3] + '...'
+        return content
 
     def filter_messages_by_age(self, messages):
         if not self.cutoff_datetime:
@@ -132,7 +228,8 @@ class Cleaner:
         for message in messages:
             message_date = message.date
             if message_date.tzinfo is None:
-                message_date = message_date.replace(tzinfo=timezone.utc)
+                message_date = message_date.replace(tzinfo=self.local_timezone)
+            message_date = message_date.astimezone(timezone.utc)
             if message_date <= self.cutoff_datetime:
                 filtered_messages.append(message)
 
@@ -140,7 +237,7 @@ class Cleaner:
 
     async def run(self):
         if not self.cutoff_datetime:
-            raise ValueError('Days threshold not set. Call prompt_days_threshold() before run().')
+            raise ValueError('Cutoff not set. Call prompt_cutoff() before run().')
 
         for chat in self.chats:
             chat_id = chat.id
@@ -151,6 +248,9 @@ class Cleaner:
                 q = await self.search_messages(chat_id, add_offset)
                 filtered_messages = self.filter_messages_by_age(q)
                 message_ids.extend(msg.id for msg in filtered_messages)
+                for msg in filtered_messages:
+                    preview = self.message_preview(msg)
+                    print(f'    - #{msg.id}: {preview}')
                 messages_count = len(q)
                 print(f'Found {len(message_ids)} of your messages in "{chat.title}"')
                 if messages_count < self.search_chunk_size:
@@ -160,9 +260,13 @@ class Cleaner:
             await self.delete_messages(chat_id=chat.id, message_ids=message_ids)
 
     async def delete_messages(self, chat_id, message_ids):
-        print(f'Deleting {len(message_ids)} messages with message IDs:')
+        action = 'Dry run - would delete' if self.dry_run else 'Deleting'
+        print(f'{action} {len(message_ids)} messages with message IDs:')
         print(message_ids)
         for chunk in self.chunks(message_ids, self.delete_chunk_size):
+            if self.dry_run:
+                print(f'Dry run: skipping deletion of {len(chunk)} messages in this chunk.')
+                continue
             try:
                 async with app:
                     await app.delete_messages(chat_id=chat_id, message_ids=chunk)
@@ -184,9 +288,11 @@ class Cleaner:
 
 async def main():
     try:
-        deleter = Cleaner()
+        deleter = Cleaner(dry_run=CLI_ARGS.dry_run)
+        if deleter.dry_run:
+            print('Dry run enabled: no messages will be deleted.')
         await deleter.select_groups()
-        deleter.prompt_days_threshold()
+        deleter.prompt_cutoff()
         await deleter.run()
     except UnknownError as e:
         print(f'UnknownError occured: {e}')
