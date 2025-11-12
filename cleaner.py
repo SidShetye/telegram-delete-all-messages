@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import datetime, timedelta, timezone
 
 from time import sleep
 
@@ -32,7 +33,7 @@ if not os.path.exists(cachePath):
 
 
 class Cleaner:
-    def __init__(self, chats=None, search_chunk_size=100, delete_chunk_size=100):
+    def __init__(self, chats=None, search_chunk_size=100, delete_chunk_size=100, days_threshold=None):
         self.chats = chats or []
         if search_chunk_size > 100:
             # https://github.com/gurland/telegram-delete-all-messages/issues/31
@@ -43,6 +44,10 @@ class Cleaner:
             raise ValueError('search_chunk_size > 100 not supported')
         self.search_chunk_size = search_chunk_size
         self.delete_chunk_size = delete_chunk_size
+        self.days_threshold = days_threshold
+        self.cutoff_datetime = None
+        if days_threshold:
+            self.set_days_threshold(days_threshold)
 
     @staticmethod
     def chunks(l, n):
@@ -97,7 +102,46 @@ class Cleaner:
         if recursive == 1:
             self.run()
 
+    def prompt_days_threshold(self):
+        while True:
+            try:
+                days_input = input('Delete only messages older than how many days? ')
+                days = int(days_input.strip())
+                if days <= 0:
+                    raise ValueError
+            except ValueError:
+                print('Please enter a positive integer value (e.g. 30).')
+                continue
+
+            self.set_days_threshold(days)
+            print(f'\nMessages newer than {days} day(s) will be skipped.\n')
+            break
+
+    def set_days_threshold(self, days):
+        if days <= 0:
+            raise ValueError('days_threshold must be a positive integer')
+        self.days_threshold = days
+        now = datetime.now(timezone.utc)
+        self.cutoff_datetime = now - timedelta(days=days)
+
+    def filter_messages_by_age(self, messages):
+        if not self.cutoff_datetime:
+            return messages
+
+        filtered_messages = []
+        for message in messages:
+            message_date = message.date
+            if message_date.tzinfo is None:
+                message_date = message_date.replace(tzinfo=timezone.utc)
+            if message_date <= self.cutoff_datetime:
+                filtered_messages.append(message)
+
+        return filtered_messages
+
     async def run(self):
+        if not self.cutoff_datetime:
+            raise ValueError('Days threshold not set. Call prompt_days_threshold() before run().')
+
         for chat in self.chats:
             chat_id = chat.id
             message_ids = []
@@ -105,7 +149,8 @@ class Cleaner:
 
             while True:
                 q = await self.search_messages(chat_id, add_offset)
-                message_ids.extend(msg.id for msg in q)
+                filtered_messages = self.filter_messages_by_age(q)
+                message_ids.extend(msg.id for msg in filtered_messages)
                 messages_count = len(q)
                 print(f'Found {len(message_ids)} of your messages in "{chat.title}"')
                 if messages_count < self.search_chunk_size:
@@ -128,7 +173,12 @@ class Cleaner:
         async with app:
             messages = []
             print(f'Searching messages. OFFSET: {add_offset}')
-            async for message in app.search_messages(chat_id=chat_id, offset=add_offset, from_user="me", limit=100):
+            async for message in app.search_messages(
+                chat_id=chat_id,
+                offset=add_offset,
+                from_user="me",
+                limit=self.search_chunk_size,
+            ):
                 messages.append(message)
             return messages
 
@@ -136,6 +186,7 @@ async def main():
     try:
         deleter = Cleaner()
         await deleter.select_groups()
+        deleter.prompt_days_threshold()
         await deleter.run()
     except UnknownError as e:
         print(f'UnknownError occured: {e}')
