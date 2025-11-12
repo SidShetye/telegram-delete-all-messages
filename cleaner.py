@@ -69,6 +69,7 @@ class Cleaner:
         self.cutoff_datetime = None
         self.local_timezone = datetime.now().astimezone().tzinfo or timezone.utc
         self.dry_run = dry_run
+        self.delete_all = False
         if days_threshold:
             self.set_days_threshold(days_threshold)
 
@@ -127,14 +128,20 @@ class Cleaner:
 
     def prompt_cutoff(self):
         prompt_text = (
-            'Delete messages sent before either a day count (e.g. 30) or a '
-            'timestamp in MM-DD-YYYY[ hh:mm[:ss]] format: '
+            '\nChoose how far back to delete your messages:\n'
+            '  • Enter a positive number of days (e.g. 30)\n'
+            '  • Enter a timestamp in MM-DD-YYYY[ hh:mm[:ss]] (e.g. 04-19-2025 11:30)\n'
+            '  • Enter "all" or 0 to delete all\n'
+            'Your choice: '
         )
         while True:
             user_input = input(prompt_text).strip()
             if not user_input:
                 print('Input cannot be empty.')
                 continue
+
+            if self.try_set_delete_all(user_input):
+                break
 
             if self.try_set_days_threshold(user_input):
                 break
@@ -146,6 +153,17 @@ class Cleaner:
                 'Invalid input. Provide a positive integer number of days or '
                 'a timestamp such as 03-25-2024 15:30:00.'
             )
+
+    def try_set_delete_all(self, raw_value):
+        normalized = raw_value.strip().lower()
+        if normalized not in ('all', '0'):
+            return False
+
+        self.delete_all = True
+        self.days_threshold = None
+        self.cutoff_datetime = None
+        print('\nDelete-all mode enabled: every message in the selected chats will be deleted.\n')
+        return True
 
     def try_set_days_threshold(self, raw_value):
         try:
@@ -190,6 +208,7 @@ class Cleaner:
         if days <= 0:
             raise ValueError('days_threshold must be a positive integer')
         self.days_threshold = days
+        self.delete_all = False
         now = datetime.now(timezone.utc)
         self.cutoff_datetime = now - timedelta(days=days)
 
@@ -200,6 +219,7 @@ class Cleaner:
             cutoff_datetime = cutoff_datetime.astimezone(self.local_timezone)
         cutoff_datetime = cutoff_datetime.astimezone(timezone.utc)
         self.days_threshold = None
+        self.delete_all = False
         self.cutoff_datetime = cutoff_datetime
 
     def describe_cutoff_times(self):
@@ -221,7 +241,7 @@ class Cleaner:
         return content
 
     def filter_messages_by_age(self, messages):
-        if not self.cutoff_datetime:
+        if self.delete_all or not self.cutoff_datetime:
             return messages
 
         filtered_messages = []
@@ -236,7 +256,7 @@ class Cleaner:
         return filtered_messages
 
     async def run(self):
-        if not self.cutoff_datetime:
+        if not self.delete_all and not self.cutoff_datetime:
             raise ValueError('Cutoff not set. Call prompt_cutoff() before run().')
 
         for chat in self.chats:
